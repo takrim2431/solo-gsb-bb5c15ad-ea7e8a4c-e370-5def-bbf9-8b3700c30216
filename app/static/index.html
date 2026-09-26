@@ -1,0 +1,506 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>多通道传感器故障规则台</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div class="brand">🛰 多通道传感器故障规则台</div>
+    <div class="actions">
+      <button id="btn-import" class="btn">导入 JSONL</button>
+      <button id="btn-demo" class="btn">载入示例</button>
+      <button id="btn-evaluate" class="btn btn-primary">评估规则</button>
+      <button id="btn-export" class="btn">导出 JSON</button>
+      <button id="btn-reset" class="btn btn-danger">清空数据</button>
+      <span id="status" class="status"></span>
+    </div>
+  </header>
+
+  <div id="import-panel" class="import-panel" hidden>
+    <div class="import-row">
+      <label class="file-pick btn">
+        选择 .jsonl 文件
+        <input type="file" id="import-file" accept=".jsonl,.ndjson,.txt,application/json" hidden />
+      </label>
+      <span id="import-filename" class="muted">未选择文件（也可直接粘贴到下方）</span>
+    </div>
+    <textarea id="import-text" rows="4"
+      placeholder='也可直接粘贴 JSONL，每行一个事件，例如：&#10;{"device":"pump-1","metric":"temp","ts":"2026-09-23T00:00:00Z","value":76.2}'></textarea>
+    <details class="mapping">
+      <summary>字段映射（可选，默认 device / metric / ts / value）</summary>
+      <div class="mapping-grid">
+        <label>设备字段 <input id="f-device" value="device" /></label>
+        <label>指标字段 <input id="f-metric" value="metric" /></label>
+        <label>时间戳字段 <input id="f-ts" value="ts" /></label>
+        <label>数值字段 <input id="f-value" value="value" /></label>
+      </div>
+      <p class="muted small">支持扁平事件，或 value 为对象的嵌套指标；时间戳支持 epoch 秒/毫秒与 ISO-8601。</p>
+    </details>
+    <div class="import-row">
+      <button id="btn-do-import" class="btn btn-primary">开始导入</button>
+      <span id="import-result" class="import-result"></span>
+    </div>
+  </div>
+
+  <div class="layout">
+    <aside class="sidebar">
+      <section class="card">
+        <div class="card-head">
+          <h2>故障规则</h2>
+          <button id="btn-new-rule" class="btn btn-small">＋ 新建</button>
+        </div>
+        <div id="rule-list" class="rule-list"></div>
+
+        <div id="rule-editor" hidden>
+          <h3 id="editor-title">新建规则</h3>
+          <label class="field">规则名称
+            <input id="rule-name" placeholder="例如：泵 1 高温持续" />
+          </label>
+          <div class="field-row">
+            <label class="field">条件组合
+              <select id="rule-logic">
+                <option value="AND">AND（全部满足）</option>
+                <option value="OR">OR（任一满足）</option>
+              </select>
+            </label>
+            <label class="field">持续时长(秒)
+              <input id="rule-duration" type="number" min="0" step="1" value="0" />
+            </label>
+          </div>
+          <div class="cond-head">
+            <span>触发条件（半开区间，边界相接按连续）</span>
+            <button id="btn-add-cond" class="btn btn-small" type="button">＋ 条件</button>
+          </div>
+          <div class="muted small cond-reset-doc">
+            可选「复位阈值」（仅 &gt;、&gt;=、&lt;、&lt;=）：首次满足原比较才命中，此后保持命中直到值到达复位边界
+            （高值触发：值 ≤ 复位值；低值触发：值 ≥ 复位值）；高值触发复位值须低于触发阈值，低值触发须高于。
+            采样有效期到期空档会清除命中状态，下一样本需重新触发。
+          </div>
+          <div id="cond-rows"></div>
+          <div class="editor-actions">
+            <button id="btn-save-rule" class="btn btn-primary">保存</button>
+            <button id="btn-preview-rule" class="btn">预览影响</button>
+            <button id="btn-cancel-rule" class="btn">取消</button>
+          </div>
+          <div id="rule-preview" class="rule-preview" hidden></div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>计划维护</h2>
+          <button id="btn-new-maint" class="btn btn-small">＋ 新建</button>
+        </div>
+        <div class="muted small maint-hint">
+          维护窗口为半开区间 [start, end)：评估时同设备重叠/相接窗口先合并，再从该设备参与规则的真值段中扣除；
+          中断会重置持续时长，窗口结束后重新累计确认。保存后自动重新评估。
+        </div>
+        <div id="maint-list" class="maint-list"></div>
+
+        <div id="maint-editor" hidden>
+          <h3 id="maint-editor-title">新建维护窗口</h3>
+          <label class="field">设备
+            <input id="maint-device" list="device-list" placeholder="例如：pump-1" />
+          </label>
+          <label class="field">名称
+            <input id="maint-name" placeholder="例如：季度检修" />
+          </label>
+          <div class="field-row">
+            <label class="field">开始
+              <input id="maint-start" type="datetime-local" step="1" />
+            </label>
+            <label class="field">结束
+              <input id="maint-end" type="datetime-local" step="1" />
+            </label>
+          </div>
+          <label class="field">备注（可选）
+            <input id="maint-note" placeholder="维护内容说明" />
+          </label>
+          <div class="editor-actions">
+            <button id="btn-save-maint" class="btn btn-primary">保存并重新评估</button>
+            <button id="btn-cancel-maint" class="btn">取消</button>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>采样有效期</h2>
+          <button id="btn-new-ttl" class="btn btn-small">＋ 设置</button>
+        </div>
+        <div class="muted small maint-hint">
+          按「设备 + 指标」配置正秒数有效期：样本值仅保持在 [采样时刻, min(下一样本时刻, 采样时刻+有效期, 数据终点))；
+          到期后的空档不满足该通道条件、重置持续时长，故障区间与证据不跨越空档。未配置的通道沿用「保持到下一样本」语义。
+          设置或清除后自动重新评估全部规则。
+        </div>
+        <div id="ttl-list" class="maint-list"></div>
+
+        <div id="ttl-editor" hidden>
+          <h3 id="ttl-editor-title">设置采样有效期</h3>
+          <label class="field">设备
+            <input id="ttl-device" list="device-list" placeholder="例如：pump-1" />
+          </label>
+          <label class="field">指标
+            <input id="ttl-metric" list="metric-list" placeholder="例如：temp" />
+          </label>
+          <label class="field">有效期（正秒数）
+            <input id="ttl-seconds" type="number" min="0" step="any" placeholder="例如：120" />
+          </label>
+          <div class="editor-actions">
+            <button id="btn-save-ttl" class="btn btn-primary">保存并重新评估</button>
+            <button id="btn-clear-ttl" class="btn btn-danger" hidden>清除有效期</button>
+            <button id="btn-cancel-ttl" class="btn">取消</button>
+          </div>
+        </div>
+      </section>
+
+      <datalist id="device-list"></datalist>
+      <datalist id="metric-list"></datalist>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>导入批次 / 撤销</h2>
+          <button id="btn-refresh-imports" class="btn btn-small">刷新</button>
+        </div>
+        <div class="muted small maint-hint">
+          文件或文本导入时，会为本批首次遇到的每个（设备、指标、时间戳）记录<b>导入前快照</b>；
+          同批重复键只快照一次、仍由最后一条有效值覆盖。仅<b>最近一次</b>且快照完整的批次允许撤销：
+          撤销会在同一事务中删除本批新增事件、恢复被覆盖事件的值 / 原始内容 / 原批次归属，再刷新故障；
+          任一步失败全部回滚。旧数据中无快照的批次不能撤销。
+        </div>
+        <div id="import-batch-list" class="maint-list"></div>
+      </section>
+    </aside>
+
+    <main class="content">
+      <section class="card filter-bar">
+        <label>起始 <input type="datetime-local" id="filter-start" step="1" /></label>
+        <label>结束 <input type="datetime-local" id="filter-end" step="1" /></label>
+        <button id="btn-apply-filter" class="btn btn-small btn-primary">应用筛选</button>
+        <button id="btn-clear-filter" class="btn btn-small">清除</button>
+        <button id="btn-fit" class="btn btn-small">适配全部数据</button>
+        <span class="muted small" id="filter-hint"></span>
+      </section>
+
+      <section class="card timeline-card">
+        <div class="card-head">
+          <h2>时间轴</h2>
+          <span class="muted small">在图上按住拖拽即可框选并创建区间标注或维护窗口；点击故障色块查看触发证据</span>
+        </div>
+        <div id="timeline-wrap">
+          <svg id="timeline"></svg>
+          <div id="brush-pop" hidden>
+            <div id="brush-time" class="small muted"></div>
+            <div class="brush-kind">
+              <label><input type="radio" name="brush-kind" value="annotation" checked /> 区间标注</label>
+              <label><input type="radio" name="brush-kind" value="maintenance" /> 维护窗口</label>
+            </div>
+            <input id="brush-label" placeholder="名称，如：计划检修" />
+            <input id="brush-device" list="device-list" placeholder="设备（维护窗口必填）" hidden />
+            <input id="brush-note" placeholder="备注（可选）" />
+            <div class="brush-actions">
+              <button id="brush-save" class="btn btn-small btn-primary">创建</button>
+              <button id="brush-cancel" class="btn btn-small">取消</button>
+            </div>
+          </div>
+          <div id="tooltip" hidden></div>
+        </div>
+        <div id="legend" class="legend"></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>故障</h2>
+          <div class="view-tabs" role="tablist">
+            <button id="tab-faults" class="tab-btn active" type="button">故障列表 <span id="fault-count" class="tab-count"></span></button>
+            <button id="tab-events" class="tab-btn" type="button">故障事件 <span id="event-grp-count" class="tab-count"></span></button>
+          </div>
+        </div>
+        <div id="fault-event-hint" class="muted small" hidden>
+          不同规则产生、时间区间<b>重叠或首尾相接</b>（含传递链）的故障归为同一事件；事件区间为成员最早开始至最晚结束。原始故障结果不受影响。
+        </div>
+        <div id="fault-list"></div>
+        <div id="fault-event-list" hidden></div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>规则组合故障日账</h2>
+          <span class="muted small">只读 · 沿用已确认故障，不触发重算</span>
+        </div>
+        <div class="muted small ledger-hint">
+          选择一组规则与 UTC 查询时间范围：读取这些规则<b>已保存的故障区间</b>，先按半开区间合并重叠或相接片段（多规则同时故障只计一次），
+          再按 <b>UTC 午夜</b>切分逐日统计去重故障秒数、新起片段数、跨日延续片段数与覆盖率。跨日片段只在起始日计「新起」，后续日计「延续」；
+          查询首尾落在日中时以当日实际查询秒数为覆盖率分母，恰在午夜结束的片段不进入次日。
+        </div>
+        <div class="ledger-controls">
+          <div class="ledger-rules" id="ledger-rules"></div>
+          <div class="ledger-form">
+            <label class="ledger-field">起始（本机时区） <input type="datetime-local" id="ledger-start" step="1" /></label>
+            <label class="ledger-field">结束（本机时区） <input type="datetime-local" id="ledger-end" step="1" /></label>
+            <button id="btn-ledger-query" class="btn btn-small btn-primary">查询日账</button>
+            <button id="btn-ledger-clear" class="btn btn-small">清除选择</button>
+            <button id="btn-ledger-fill" class="btn btn-small">填入当前筛选范围</button>
+          </div>
+          <div class="muted small">时间在本机时区输入、按 UTC 查询，并以 <b>UTC 午夜（00:00 UTC）</b>切分逐日。</div>
+        </div>
+        <div id="ledger-summary" class="ledger-summary" hidden></div>
+        <div id="ledger-table-wrap" class="ledger-table-wrap" hidden>
+          <table class="data-table ledger-table">
+            <thead>
+              <tr>
+                <th>UTC 日期</th>
+                <th>当日查询秒数</th>
+                <th>去重故障秒数</th>
+                <th>新起片段</th>
+                <th>跨日延续</th>
+                <th>覆盖率</th>
+              </tr>
+            </thead>
+            <tbody id="ledger-rows"></tbody>
+            <tfoot id="ledger-total"></tfoot>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>采样节拍稽核</h2>
+          <span class="muted small">只读 · 读取 events 表，不改写事件或故障结果</span>
+        </div>
+        <div class="muted small ledger-hint">
+          从已有通道选择<b>设备与指标</b>，输入 <b>UTC 半开时间范围</b> <code>[start, end)</code>、<b>预期采样周期</b>（秒）与
+          <b>允许偏差</b>（秒，必须严格小于半个周期）。以范围起点为锚点生成预期时刻 <code>start + k×周期</code>（&lt; end）；
+          仅将<b>范围内、偏差内</b>的实际事件归入其<b>最近</b>预期时刻，同一时刻最多计一次，其余事件列为偏拍 / 重复；
+          连续未命中的预期时刻合并为<b>缺采段</b>，给出每段首末预期时刻与缺采点数，并返回整体命中率。
+        </div>
+        <div class="ledger-form">
+          <label class="ledger-field">设备
+            <select id="audit-device"></select>
+          </label>
+          <label class="ledger-field">指标
+            <select id="audit-metric"></select>
+          </label>
+          <label class="ledger-field">起始（本机时区） <input type="datetime-local" id="audit-start" step="1" /></label>
+          <label class="ledger-field">结束（本机时区） <input type="datetime-local" id="audit-end" step="1" /></label>
+          <label class="ledger-field">采样周期（秒） <input id="audit-period" type="number" min="0" step="any" value="60" /></label>
+          <label class="ledger-field">允许偏差（秒，&lt; 半周期） <input id="audit-tolerance" type="number" min="0" step="any" value="5" /></label>
+          <button id="btn-audit-query" class="btn btn-small btn-primary">稽核</button>
+          <button id="btn-audit-fill" class="btn btn-small">填入当前筛选范围</button>
+        </div>
+        <div class="muted small">时间在本机时区输入、按 UTC 查询；偏差恰为半个周期不被接受（相邻预期时刻的归属存在歧义）。</div>
+        <div id="audit-summary" class="ledger-summary" hidden></div>
+        <div id="audit-missing-wrap" class="ledger-table-wrap" hidden>
+          <table class="data-table ledger-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>首预期时刻（UTC）</th>
+                <th>末预期时刻（UTC）</th>
+                <th>段跨度</th>
+                <th>缺采点数</th>
+              </tr>
+            </thead>
+            <tbody id="audit-missing-rows"></tbody>
+          </table>
+        </div>
+        <div id="audit-extra-wrap" class="audit-extra-wrap" hidden>
+          <details>
+            <summary class="muted small">未计入事件（偏拍 / 重复） <span id="audit-extra-count"></span></summary>
+            <div class="ledger-table-wrap">
+              <table class="data-table ledger-table">
+                <thead>
+                  <tr><th>事件时间（UTC）</th><th>原因</th></tr>
+                </thead>
+                <tbody id="audit-extra-rows"></tbody>
+              </table>
+            </div>
+          </details>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>冗余通道一致性核查</h2>
+          <span class="muted small">只读 · 即时读取当前事件，不写入故障结果或触发重算</span>
+        </div>
+        <div class="muted small ledger-hint">
+          从已有通道选择<b>两条不同通道</b>，输入 <b>UTC 半开时间范围</b> <code>[start, end)</code> 与<b>非负绝对差阈值</b>。
+          两通道按各自采样时刻展开持值区间（沿用各通道<b>采样有效期 TTL</b> 与<b>全局数据终点</b>，并纳入范围起点前仍有效的最后样本）；
+          仅在两通道<b>同时有效的交集</b>上比较，任一方到期的空档不外推。绝对差<b>严格大于</b>阈值即形成不一致片段，
+          相接片段自动合并；逐段给出起止、持续秒数、最大差值及对应的两条样本时间和值，并汇总可比秒数与不一致秒数。
+        </div>
+        <div class="ledger-form">
+          <label class="ledger-field">通道 A 设备
+            <select id="cons-device-a"></select>
+          </label>
+          <label class="ledger-field">通道 A 指标
+            <select id="cons-metric-a"></select>
+          </label>
+          <label class="ledger-field">通道 B 设备
+            <select id="cons-device-b"></select>
+          </label>
+          <label class="ledger-field">通道 B 指标
+            <select id="cons-metric-b"></select>
+          </label>
+          <label class="ledger-field">起始（本机时区） <input type="datetime-local" id="cons-start" step="1" /></label>
+          <label class="ledger-field">结束（本机时区） <input type="datetime-local" id="cons-end" step="1" /></label>
+          <label class="ledger-field">绝对差阈值（≥ 0） <input id="cons-threshold" type="number" min="0" step="any" value="1" /></label>
+          <button id="btn-cons-query" class="btn btn-small btn-primary">核查</button>
+          <button id="btn-cons-fill" class="btn btn-small">填入当前筛选范围</button>
+        </div>
+        <div class="muted small">时间在本机时区输入、按 UTC 查询；仅在两通道同时有效的交集上比较，任一方到期的空档不外推。</div>
+        <div id="cons-summary" class="ledger-summary" hidden></div>
+        <div id="cons-segments-wrap" class="ledger-table-wrap" hidden>
+          <table class="data-table ledger-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>开始（UTC）</th>
+                <th>结束（UTC）</th>
+                <th>持续秒数</th>
+                <th>最大绝对差</th>
+                <th>通道 A 对应样本</th>
+                <th>通道 B 对应样本</th>
+              </tr>
+            </thead>
+            <tbody id="cons-segment-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>规则故障先后配对</h2>
+          <span class="muted small">只读 · 读取已保存故障，不重算不写入</span>
+        </div>
+        <div class="muted small ledger-hint">
+          从现有规则选择<b>两条不同规则</b>作为前因与后续，输入 <b>UTC 半开时间范围</b> <code>[start, end)</code> 与
+          <b>正数最大滞后秒数</b>。只取<b>起点落在范围内</b>的已保存故障区间：以后续故障起点<b>晚于</b>前因起点且
+          不超过最大滞后进行配对；每段故障最多参与一对，在保持时间顺序的一对一配对中<b>先最大化配对数、再最小化总滞后</b>，
+          平局按故障 ID 稳定选择。下方列出配对（双方故障 ID、起点与滞后）、双方未配对段与各自配对率。
+        </div>
+        <div class="ledger-form">
+          <label class="ledger-field">前因规则
+            <select id="pair-rule-cause"></select>
+          </label>
+          <label class="ledger-field">后续规则
+            <select id="pair-rule-effect"></select>
+          </label>
+          <label class="ledger-field">起始（本机时区） <input type="datetime-local" id="pair-start" step="1" /></label>
+          <label class="ledger-field">结束（本机时区） <input type="datetime-local" id="pair-end" step="1" /></label>
+          <label class="ledger-field">最大滞后（秒，&gt; 0） <input id="pair-max-lag" type="number" min="0" step="any" value="600" /></label>
+          <button id="btn-pair-query" class="btn btn-small btn-primary">配对</button>
+          <button id="btn-pair-fill" class="btn btn-small">填入当前筛选范围</button>
+        </div>
+        <div class="muted small">时间在本机时区输入、按 UTC 查询；只读取已保存的故障区间，不触发重算、不写入任何结果。</div>
+        <div id="pair-summary" class="ledger-summary" hidden></div>
+        <div id="pair-table-wrap" class="ledger-table-wrap" hidden>
+          <table class="data-table ledger-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>前因故障 ID</th>
+                <th>前因起点（UTC）</th>
+                <th>后续故障 ID</th>
+                <th>后续起点（UTC）</th>
+                <th>滞后秒数</th>
+              </tr>
+            </thead>
+            <tbody id="pair-rows"></tbody>
+          </table>
+        </div>
+        <div id="pair-unmatched-wrap" class="pair-unmatched" hidden>
+          <div>
+            <div class="pair-unmatched-head">前因未配对段 <span id="pair-unmatched-cause-count" class="tab-count"></span></div>
+            <div class="ledger-table-wrap">
+              <table class="data-table ledger-table">
+                <thead><tr><th>故障 ID</th><th>起点（UTC）</th><th>区间</th></tr></thead>
+                <tbody id="pair-unmatched-cause-rows"></tbody>
+              </table>
+            </div>
+          </div>
+          <div>
+            <div class="pair-unmatched-head">后续未配对段 <span id="pair-unmatched-effect-count" class="tab-count"></span></div>
+            <div class="ledger-table-wrap">
+              <table class="data-table ledger-table">
+                <thead><tr><th>故障 ID</th><th>起点（UTC）</th><th>区间</th></tr></thead>
+                <tbody id="pair-unmatched-effect-rows"></tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head">
+          <h2>单通道突变恢复诊断</h2>
+          <span class="muted small">只读 · 读取事件与通道有效期，不重算故障</span>
+        </div>
+        <div class="muted small ledger-hint">
+          从已有通道选择<b>设备与指标</b>，输入 <b>UTC 半开时间范围</b> <code>[start, end)</code>、<b>正数跳变速率阈值</b>（单位 / 秒）、
+          <b>非负回归容差</b>与<b>正数观察时长</b>（秒）。服务端按相邻有效样本的<b>实际时间差</b>计算变化速率；
+          <b>采样有效期到期的空档切断连续性，不跨空档判突变</b>，范围起点前仍有效的最近样本可作<b>基线</b>。
+          速率严格超过阈值时记下突变前基线，并在观察时长内寻找<b>首个回到基线容差内</b>的样本：找到为<b>已恢复</b>（给出恢复耗时），
+          否则为<b>未恢复</b>（观察超时 / 有效期空档切断 / 范围结束）。已归属片段的样本不会重复开段。
+        </div>
+        <div class="ledger-form">
+          <label class="ledger-field">设备
+            <select id="rec-device"></select>
+          </label>
+          <label class="ledger-field">指标
+            <select id="rec-metric"></select>
+          </label>
+          <label class="ledger-field">起始（本机时区） <input type="datetime-local" id="rec-start" step="1" /></label>
+          <label class="ledger-field">结束（本机时区） <input type="datetime-local" id="rec-end" step="1" /></label>
+          <label class="ledger-field">跳变速率阈值（&gt; 0，单位/秒） <input id="rec-rate" type="number" min="0" step="any" value="0.1" /></label>
+          <label class="ledger-field">回归容差（≥ 0） <input id="rec-tolerance" type="number" min="0" step="any" value="1" /></label>
+          <label class="ledger-field">观察时长（秒，&gt; 0） <input id="rec-observation" type="number" min="0" step="any" value="300" /></label>
+          <button id="btn-rec-query" class="btn btn-small btn-primary">诊断</button>
+          <button id="btn-rec-fill" class="btn btn-small">填入当前筛选范围</button>
+        </div>
+        <div class="muted small">时间在本机时区输入、按 UTC 查询；速率 = |Δ值| / 相邻样本实际秒数，严格大于阈值才判突变；回到基线容差按 |值 − 基线| ≤ 容差判定。</div>
+        <div id="rec-summary" class="ledger-summary" hidden></div>
+        <div id="rec-segments-wrap" class="ledger-table-wrap" hidden>
+          <table class="data-table ledger-table">
+            <thead>
+              <tr>
+                <th>#</th>
+                <th>状态</th>
+                <th>突变前基线样本</th>
+                <th>突变起始样本</th>
+                <th>结束样本</th>
+                <th>跳变速率</th>
+                <th>最大偏差</th>
+                <th>恢复耗时 / 未恢复原因</th>
+              </tr>
+            </thead>
+            <tbody id="rec-segment-rows"></tbody>
+          </table>
+        </div>
+      </section>
+
+      <section class="card">
+        <div class="card-head"><h2>区间标注</h2><span id="anno-count" class="muted"></span></div>
+        <div id="anno-list"></div>
+      </section>
+
+      <details class="card">
+        <summary class="card-head"><h2>原始事件</h2><span id="event-count" class="muted"></span></summary>
+        <div class="events-wrap">
+          <table class="data-table">
+            <thead><tr><th>时间</th><th>设备</th><th>指标</th><th>值</th></tr></thead>
+            <tbody id="event-rows"></tbody>
+          </table>
+          <button id="btn-more-events" class="btn btn-small" hidden>加载更多</button>
+        </div>
+      </details>
+    </main>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

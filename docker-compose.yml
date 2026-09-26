@@ -1,0 +1,16 @@
+services:
+  sensor-fault-rules:
+    build: .
+    image: sensor-fault-rules:latest
+    container_name: sensor-fault-rules
+    ports:
+      - "8000:8000"
+    volumes:
+      - sensor-data:/data
+    environment:
+      # SQLite database file inside the container (persisted via the volume)
+      SENSOR_DB_PATH: /data/sensor.db
+    restart: unless-stopped
+
+volumes:
+  sensor-data:
