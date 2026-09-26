@@ -222,25 +222,32 @@ def undo_import(import_id: int, reevaluate: bool = True) -> dict:
     """Revoke one import batch atomically.
 
     Only the most recent non-revoked batch whose pre-import snapshots are
-    complete may be revoked.  In a single transaction the batch's newly
-    inserted events are deleted, while events it overwritten get back their
-    previous value, raw content and original batch ownership; the batch is
-    then marked revoked.  Any failure rolls the whole operation back.
+    complete may be revoked.  Existence, revocation status, snapshot
+    completeness and the "latest live batch" (LIFO) check all run **inside the
+    single serialized write transaction**, on the writer connection, together
+    with the snapshot deletes/restores and the revoked marker — never in a
+    read-only pre-check outside the write lock.  A concurrent duplicate undo
+    or a newer batch imported between a stale pre-check and the write therefore
+    reaches the decision here, serialized, and is refused with the regular
+    404/409 semantics instead of out-of-order revocation or a row-count
+    failure surfacing as 500.  Any failure rolls the whole operation back.
     """
-    row = db.query_one("SELECT * FROM imports WHERE id = ?", (import_id,))
-    if row is None:
-        raise KeyError(f"import batch {import_id} not found")
-    if row["revoked_at"] is not None:
-        raise UndoNotAllowed("该导入批次已撤销，不能重复撤销")
-    if not row["snapshot_complete"]:
-        raise UndoNotAllowed("该批次导入时未记录快照（旧数据），无法撤销")
-    latest = db.query_one(
-        "SELECT MAX(id) AS id FROM imports WHERE revoked_at IS NULL"
-    )
-    if latest is None or latest["id"] != import_id:
-        raise UndoNotAllowed("仅允许撤销最近一次导入批次，请先撤销其后的导入")
-
     with db.transaction() as tx:
+        row = tx.execute(
+            "SELECT * FROM imports WHERE id = ?", (import_id,)
+        ).fetchone()
+        if row is None:
+            raise KeyError(f"import batch {import_id} not found")
+        if row["revoked_at"] is not None:
+            raise UndoNotAllowed("该导入批次已撤销，不能重复撤销")
+        if not row["snapshot_complete"]:
+            raise UndoNotAllowed("该批次导入时未记录快照（旧数据），无法撤销")
+        latest = tx.execute(
+            "SELECT MAX(id) AS id FROM imports WHERE revoked_at IS NULL"
+        ).fetchone()
+        if latest is None or latest["id"] != import_id:
+            raise UndoNotAllowed("仅允许撤销最近一次导入批次，请先撤销其后的导入")
+
         snapshots = tx.execute(
             "SELECT * FROM import_snapshots WHERE import_id = ?"
             " ORDER BY id",

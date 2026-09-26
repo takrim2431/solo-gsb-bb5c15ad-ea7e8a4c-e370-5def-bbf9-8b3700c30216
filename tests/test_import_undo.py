@@ -3,13 +3,16 @@
 Covers pre-import snapshots (one per batch-unique key, last value still wins),
 undo deleting new events / restoring overwritten events' value/raw/ownership,
 "latest batch only" and "snapshot complete" guards, revoked batches, the
-single-transaction rollback semantics, fault refresh after undo and snapshots
-being wiped on reset.
+single-transaction rollback semantics, fault refresh after undo, concurrency
+guards (duplicate undo / a newer batch landing concurrently must keep the
+404/409 semantics and the LIFO order) and snapshots being wiped on reset.
 """
 
 import json
 import os
 import tempfile
+import threading
+from contextlib import contextmanager
 
 import pytest
 
@@ -368,3 +371,183 @@ def test_api_reset_wipes_batch_snapshots(client):
     assert len(client.get("/api/imports").json()) == 1
     client.post("/api/reset")
     assert client.get("/api/imports").json() == []
+
+
+# --------------------------------------------------------------------------- #
+# Concurrency: every guard must be decided inside the serialized write
+# transaction, together with the snapshot restore and the revoked marker.
+# The old code did the checks in read-only statements before taking the write
+# lock, so a decision made there could be invalidated before the write ran.
+# --------------------------------------------------------------------------- #
+
+
+def test_concurrent_duplicate_undo_second_caller_gets_409_not_500(
+    scratch_db, monkeypatch
+):
+    """Two requests undo the same batch concurrently.
+
+    Both threads may have decided the batch is undoable before either enters
+    its write transaction.  Whichever serializes first revokes it; the second
+    must then observe the batch already revoked *inside its transaction* and
+    fail with UndoNotAllowed (409) — never reach the guarded DELETE/UPDATE,
+    whose 0-row match used to surface as RuntimeError (500).
+    """
+    batch = import_jsonl([row("d", "m", 1, 10), row("d", "m", 2, 11)])
+    bid = batch["import_id"]
+
+    # Pause the first writer inside its serialized transaction and release it
+    # only after the second writer has finished its own (old-style) pre-checks
+    # and is queued on the write lock.
+    real_transaction = db.transaction
+    first_entered = threading.Event()
+    second_checked = threading.Event()
+    release = threading.Event()
+    entries = {"n": 0}
+
+    @contextmanager
+    def shim_transaction():
+        entries["n"] += 1
+        if entries["n"] == 1:
+            with real_transaction() as tx:
+                first_entered.set()
+                assert release.wait(15), "test harness: first undo never released"
+                yield tx
+            return
+        # Second writer: before contending for the lock, let any read-only
+        # pre-check run (the old implementation did exactly this).
+        second_checked.set()
+        with real_transaction() as tx:
+            yield tx
+
+    monkeypatch.setattr(db, "transaction", shim_transaction)
+    outcomes = []
+
+    def do_undo():
+        try:
+            outcomes.append(("ok", services.undo_import(bid, reevaluate=False)))
+        except Exception as exc:  # noqa: BLE001 - the test asserts the type
+            outcomes.append((type(exc).__name__, str(exc)))
+
+    t1 = threading.Thread(target=do_undo)
+    t2 = threading.Thread(target=do_undo)
+    t1.start()
+    assert first_entered.wait(5), "first undo never entered its transaction"
+    t2.start()
+    assert second_checked.wait(5), "second undo never reached its decision point"
+    release.set()
+    t1.join(10)
+    t2.join(10)
+    assert not t1.is_alive() and not t2.is_alive()
+
+    kinds = sorted(k for k, _ in outcomes)
+    assert kinds == ["UndoNotAllowed", "ok"], outcomes
+    # Exactly one undo committed: the events are gone, the batch is revoked.
+    assert db.query_one("SELECT COUNT(*) AS c FROM events")["c"] == 0
+    assert db.query_one("SELECT revoked_at FROM imports WHERE id = ?", (bid,))[
+        "revoked_at"
+    ] is not None
+
+
+def test_undo_refused_when_newer_batch_imports_after_stale_decision(
+    scratch_db, monkeypatch
+):
+    """A newer batch committed between the stale LIFO decision and the undo
+    write must make the undo fail 409 inside its transaction; the older batch
+    must stay live (no out-of-order revocation, no 500 from stale snapshots)."""
+    a = import_jsonl([row("d", "m", 1, 10)], filename="a.jsonl")
+
+    # Hold the first writer before it takes the real write lock: the old
+    # implementation had already passed every read-only guard at that point.
+    real_transaction = db.transaction
+    undo_reached = threading.Event()
+    release_undo = threading.Event()
+
+    @contextmanager
+    def shim_transaction():
+        if not undo_reached.is_set():
+            undo_reached.set()
+            assert release_undo.wait(15), "test harness: undo never released"
+        with real_transaction() as tx:
+            yield tx
+
+    monkeypatch.setattr(db, "transaction", shim_transaction)
+    outcomes = []
+
+    def do_undo():
+        try:
+            outcomes.append(("ok", services.undo_import(a["import_id"], reevaluate=False)))
+        except Exception as exc:  # noqa: BLE001 - the test asserts the type
+            outcomes.append((type(exc).__name__, str(exc)))
+
+    t = threading.Thread(target=do_undo)
+    t.start()
+    assert undo_reached.wait(5), "undo never reached its write section"
+
+    # A newer batch imports and commits while the undo decision is stale.  In
+    # the real race the import commits between the old pre-check and the undo
+    # write; here it simply commits before the undo is allowed to proceed.
+    b = import_jsonl([row("d", "m", 2, 20)], filename="b.jsonl", reevaluate=False)
+    release_undo.set()
+    t.join(10)
+    assert not t.is_alive()
+
+    assert len(outcomes) == 1
+    kind, message = outcomes[0]
+    assert kind == "UndoNotAllowed", outcomes
+    assert "最近一次" in message
+    # LIFO preserved: batch A is still live with its event untouched, and the
+    # only valid undo is now batch B.
+    row_a = db.query_one("SELECT revoked_at FROM imports WHERE id = ?", (a["import_id"],))
+    assert row_a["revoked_at"] is None
+    assert _event("d", "m", 1)["value"] == 10
+    assert _event("d", "m", 2)["value"] == 20
+    services.undo_import(b["import_id"], reevaluate=False)
+    services.undo_import(a["import_id"], reevaluate=False)
+    assert db.query_one("SELECT COUNT(*) AS c FROM events")["c"] == 0
+
+
+def test_api_concurrent_duplicate_undo_returns_200_and_409(client, monkeypatch):
+    """HTTP-level race: one success, one 409 — never a 500 from the second
+    request's stale snapshot restore."""
+    r = client.post(
+        "/api/import/text",
+        json={"text": json.dumps(row("d", "m", 1, 10))},
+    )
+    bid = r.json()["import_id"]
+
+    real_transaction = db.transaction
+    first_entered = threading.Event()
+    second_checked = threading.Event()
+    release = threading.Event()
+    entries = {"n": 0}
+
+    @contextmanager
+    def shim_transaction():
+        entries["n"] += 1
+        if entries["n"] == 1:
+            with real_transaction() as tx:
+                first_entered.set()
+                assert release.wait(15), "test harness: first undo never released"
+                yield tx
+            return
+        second_checked.set()
+        with real_transaction() as tx:
+            yield tx
+
+    monkeypatch.setattr(db, "transaction", shim_transaction)
+    statuses = []
+
+    def do_undo():
+        statuses.append(client.post(f"/api/imports/{bid}/undo").status_code)
+
+    t1 = threading.Thread(target=do_undo)
+    t2 = threading.Thread(target=do_undo)
+    t1.start()
+    assert first_entered.wait(5)
+    t2.start()
+    assert second_checked.wait(5)
+    release.set()
+    t1.join(10)
+    t2.join(10)
+
+    assert sorted(statuses) == [200, 409], statuses
