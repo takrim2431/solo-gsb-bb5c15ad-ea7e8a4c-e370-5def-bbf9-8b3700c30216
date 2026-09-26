@@ -4,12 +4,19 @@ Covers pre-import snapshots (one per batch-unique key, last value still wins),
 undo deleting new events / restoring overwritten events' value/raw/ownership,
 "latest batch only" and "snapshot complete" guards, revoked batches, the
 single-transaction rollback semantics, fault refresh after undo and snapshots
-being wiped on reset.
+being wiped on reset.  The concurrency section pins the eligibility checks
+(batch exists / not revoked / snapshot complete / still the latest live batch)
+and the revoke itself into one serialized write transaction: a concurrent
+import or duplicate undo loses with the usual 409 semantics instead of an
+out-of-order revoke or a 500.
 """
 
 import json
 import os
 import tempfile
+import threading
+import time
+from contextlib import contextmanager
 
 import pytest
 
@@ -300,6 +307,185 @@ def test_schema_migration_for_old_imports_table(scratch_db):
     db.query("SELECT * FROM import_snapshots")
     with pytest.raises(services.UndoNotAllowed):
         services.undo_import(1)
+
+
+# --------------------------------------------------------------------------- #
+# concurrency: eligibility checks and the revoke share one write transaction
+# --------------------------------------------------------------------------- #
+
+
+def _blocking_transaction(entered, release):
+    """Wrap db.transaction so the FIRST entered transaction blocks (holding
+    the write lock) until released; every later transaction passes through."""
+    armed = threading.Event()
+    armed.set()
+    real_transaction = db.transaction
+
+    @contextmanager
+    def blocking_transaction():
+        if armed.is_set():
+            armed.clear()
+            with real_transaction() as tx:
+                entered.set()
+                assert release.wait(15), "test harness: transaction never released"
+                yield tx
+        else:
+            with real_transaction() as tx:
+                yield tx
+
+    return blocking_transaction
+
+
+def test_undo_rechecks_latest_after_concurrent_import(scratch_db, monkeypatch):
+    """The reported race: the undo of batch A is checked while a concurrent
+    import is committing batch B.  The undo must re-check inside the
+    serialized write transaction, refuse with UndoNotAllowed (409 semantics)
+    and leave batch A untouched — never revoke A out of order beneath B."""
+    a = import_jsonl([row("d", "m", 1, 10)], filename="a.jsonl")
+
+    # The concurrent import blocks mid-transaction (holding the write lock)
+    # until the undo request has started and queued behind the lock.
+    entered = threading.Event()
+    release = threading.Event()
+    armed = threading.Event()
+    armed.set()
+    real_snapshot = db.snapshot_import_key
+
+    def blocking_snapshot(*args, **kwargs):
+        if armed.is_set():
+            armed.clear()
+            entered.set()
+            assert release.wait(15), "test harness: import never released"
+        return real_snapshot(*args, **kwargs)
+
+    monkeypatch.setattr(db, "snapshot_import_key", blocking_snapshot)
+
+    import_done = threading.Event()
+
+    def run_import():
+        services.import_events(json.dumps(row("d", "m", 2, 20)), filename="b.jsonl")
+        import_done.set()
+
+    ti = threading.Thread(target=run_import)
+    ti.start()
+    assert entered.wait(5), "import never reached its write transaction"
+
+    outcome = {}
+
+    def run_undo():
+        try:
+            outcome["result"] = services.undo_import(a["import_id"])
+        except services.UndoNotAllowed as exc:
+            outcome["conflict"] = str(exc)
+
+    tu = threading.Thread(target=run_undo)
+    tu.start()
+    time.sleep(0.3)
+    # The undo cannot commit while the import holds the write lock.
+    assert not import_done.is_set()
+    release.set()  # the import commits first: B becomes the latest live batch
+    ti.join(10)
+    tu.join(10)
+    assert import_done.is_set()
+
+    # Refused as a normal conflict — not revoked out of order, never a 500.
+    assert "result" not in outcome
+    assert "最近一次" in outcome["conflict"]
+    batch_a = db.query_one("SELECT * FROM imports WHERE id = ?", (a["import_id"],))
+    assert batch_a["revoked_at"] is None
+    assert _event("d", "m", 1)["value"] == 10
+    assert _event("d", "m", 2)["value"] == 20
+
+
+def test_concurrent_duplicate_undo_loser_gets_conflict(scratch_db, monkeypatch):
+    """Two undos of the same batch race: exactly one commits, the loser
+    re-checks inside its own serialized transaction and gets the usual
+    UndoNotAllowed (409 '已撤销') — never a snapshot-consistency 500."""
+    a = import_jsonl([row("d", "m", 1, 10), row("d", "m", 2, 11)], filename="a.jsonl")
+
+    # The first undo blocks inside its write transaction (holding the write
+    # lock) until the second undo has queued behind the lock.
+    entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(db, "transaction", _blocking_transaction(entered, release))
+
+    outcomes = [{}, {}]
+
+    def run_undo(index):
+        try:
+            outcomes[index]["result"] = services.undo_import(a["import_id"])
+        except services.UndoNotAllowed as exc:
+            outcomes[index]["conflict"] = str(exc)
+
+    t1 = threading.Thread(target=run_undo, args=(0,))
+    t1.start()
+    assert entered.wait(5), "first undo never reached its write transaction"
+    t2 = threading.Thread(target=run_undo, args=(1,))
+    t2.start()
+    time.sleep(0.3)  # second undo queues behind the first one's write lock
+    release.set()
+    t1.join(10)
+    t2.join(10)
+
+    # Exactly one undo succeeded; the loser got the 409 conflict semantics.
+    results = [o["result"] for o in outcomes if "result" in o]
+    conflicts = [o["conflict"] for o in outcomes if "conflict" in o]
+    assert len(results) == 1
+    assert results[0]["deleted_events"] == 2
+    assert len(conflicts) == 1
+    assert "已撤销" in conflicts[0]
+    # The batch was revoked exactly once; its events are gone.
+    batch = db.query_one("SELECT * FROM imports WHERE id = ?", (a["import_id"],))
+    assert batch["revoked_at"] is not None
+    assert db.query_one("SELECT COUNT(*) AS c FROM events")["c"] == 0
+
+
+def test_import_serializes_behind_inflight_undo(scratch_db, monkeypatch):
+    """The mirror interleaving: an import requested while an undo holds the
+    write transaction must wait, then import on top of the revoked state and
+    become the new latest live batch — no deadlock, no lost update."""
+    a = import_jsonl([row("d", "m", 1, 10)], filename="a.jsonl")
+
+    entered = threading.Event()
+    release = threading.Event()
+    monkeypatch.setattr(db, "transaction", _blocking_transaction(entered, release))
+
+    undo_done = threading.Event()
+
+    def run_undo():
+        services.undo_import(a["import_id"])
+        undo_done.set()
+
+    tu = threading.Thread(target=run_undo)
+    tu.start()
+    assert entered.wait(5), "undo never reached its write transaction"
+
+    imported = {}
+    import_done = threading.Event()
+
+    def run_import():
+        imported["result"] = services.import_events(
+            json.dumps(row("d", "m", 2, 20)), filename="b.jsonl"
+        )
+        import_done.set()
+
+    ti = threading.Thread(target=run_import)
+    ti.start()
+    time.sleep(0.3)
+    # The import's write transaction serializes behind the in-flight undo.
+    assert not import_done.is_set()
+    release.set()
+    tu.join(10)
+    ti.join(10)
+    assert undo_done.is_set() and import_done.is_set()
+
+    # Final committed state: A revoked (its event deleted), B live and latest.
+    batches = {b["id"]: b for b in services.list_import_batches()}
+    assert batches[a["import_id"]]["revoked"] is True
+    new_id = imported["result"]["import_id"]
+    assert batches[new_id]["can_undo"] is True
+    assert _event("d", "m", 1) is None
+    assert _event("d", "m", 2)["value"] == 20
 
 
 # --------------------------------------------------------------------------- #

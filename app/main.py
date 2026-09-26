@@ -289,9 +289,13 @@ def list_imports() -> list[dict]:
 def undo_import(import_id: int) -> dict:
     """Revoke the most recent, fully snapshotted import batch.
 
-    Deletes the batch's newly inserted events, restores overwritten events'
-    previous value/raw/batch ownership in one transaction, then refreshes
-    faults via the regular evaluation flow.
+    Eligibility (batch exists, not revoked, snapshot complete, still the
+    latest live batch) is checked inside the same serialized write
+    transaction that deletes the batch's newly inserted events, restores
+    overwritten events' previous value/raw/batch ownership and marks the
+    batch revoked — a concurrent import or duplicate undo serializes
+    against it and loses with the usual 404/409, never an out-of-order
+    revoke.  Faults are then refreshed via the regular evaluation flow.
     """
     try:
         return services.undo_import(import_id)
